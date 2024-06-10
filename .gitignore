@@ -1,6 +1,6 @@
 .tsbuildinfo
 .cache
-/out*/
+
 release/
 release-npm-package/
 release-standalone/
