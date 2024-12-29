@@ -8,10 +8,10 @@ import * as path from "path"
 import { WebsocketRequest } from "../../../typings/pluginapi"
 import { logError } from "../../common/util"
 import { CodeArgs, toCodeArgs } from "../cli"
-import { isDevMode } from "../constants"
+import { isDevMode, vsRootPath } from "../constants"
 import { authenticated, ensureAuthenticated, ensureOrigin, redirect, replaceTemplates, self } from "../http"
 import { SocketProxyProvider } from "../socket"
-import { isFile, loadAMDModule } from "../util"
+import { isFile } from "../util"
 import { Router as WsRouter } from "../wsRouter"
 
 export const router = express.Router()
@@ -31,11 +31,52 @@ export interface IVSCodeServerAPI {
   dispose(): void
 }
 
-// See ../../../lib/vscode/src/vs/server/node/server.main.ts:72.
-export type CreateServer = (address: string | net.AddressInfo | null, args: CodeArgs) => Promise<IVSCodeServerAPI>
+/**
+ * VS Code's CLI entrypoint (../../../lib/vscode/src/server-main.js).
+ *
+ * Normally VS Code will run `node server-main.js` which starts either the web
+ * server or the CLI (for installing extensions, etc) but we patch it so we can
+ * `require` it and call its functions directly in order to integrate with our
+ * web server.
+ */
+export type VSCodeModule = {
+  // See ../../../lib/vscode/src/server-main.js:339.
+  loadCodeWithNls(): Promise<{
+    // See ../../../lib/vscode/src/vs/server/node/server.main.ts:72.
+    createServer(address: string | net.AddressInfo | null, args: CodeArgs): Promise<IVSCodeServerAPI>
+    // See ../../../lib/vscode/src/vs/server/node/server.main.ts:65.
+    spawnCli(args: CodeArgs): Promise<void>
+  }>
+}
 
-// The VS Code server is dynamically loaded in when a request is made to this
-// router by `ensureCodeServerLoaded`.
+/**
+ * Load then create the VS Code server.
+ */
+async function loadVSCode(req: express.Request): Promise<IVSCodeServerAPI> {
+  // Since server-main.js is an ES module, we have to use `import`.  However,
+  // tsc will transpile this to `require` unless we change our module type,
+  // which will also require that we switch to ESM, since a hybrid approach
+  // breaks importing `rotating-file-stream` for some reason.  To work around
+  // this, use `eval` for now, but we should consider switching to ESM.
+  const modPath = path.join(vsRootPath, "out/server-main.js")
+  const mod = (await eval(`import("${modPath}")`)) as VSCodeModule
+  const serverModule = await mod.loadCodeWithNls()
+  return serverModule.createServer(null, {
+    ...(await toCodeArgs(req.args)),
+    "accept-server-license-terms": true,
+    // This seems to be used to make the connection token flags optional (when
+    // set to 1.63) but we have always included them.
+    compatibility: "1.64",
+    "without-connection-token": true,
+  })
+}
+
+// To prevent loading the module more than once at a time.  We also have the
+// resolved value so you do not need to `await` everywhere.
+let vscodeServerPromise: Promise<IVSCodeServerAPI> | undefined
+
+// The resolved value from the dynamically loaded VS Code server.  Do not use
+// without first calling and awaiting `ensureCodeServerLoaded`.
 let vscodeServer: IVSCodeServerAPI | undefined
 
 /**
@@ -49,21 +90,21 @@ export const ensureVSCodeLoaded = async (
   if (vscodeServer) {
     return next()
   }
-  // See ../../../lib/vscode/src/vs/server/node/server.main.ts:72.
-  const createVSServer = await loadAMDModule<CreateServer>("vs/server/node/server.main", "createServer")
+  if (!vscodeServerPromise) {
+    vscodeServerPromise = loadVSCode(req)
+  }
   try {
-    vscodeServer = await createVSServer(null, {
-      ...(await toCodeArgs(req.args)),
-      "accept-server-license-terms": true,
-      // This seems to be used to make the connection token flags optional (when
-      // set to 1.63) but we have always included them.
-      compatibility: "1.64",
-      "without-connection-token": true,
-    })
+    vscodeServer = await vscodeServerPromise
   } catch (error) {
+    vscodeServerPromise = undefined // Unset so we can try again.
     logError(logger, "CodeServerRouteWrapper", error)
     if (isDevMode) {
-      return next(new Error((error instanceof Error ? error.message : error) + " (VS Code may still be compiling)"))
+      return next(
+        new Error(
+          (error instanceof Error ? error.message : error) +
+            " (Have you applied the patches? If so, VS Code may still be compiling)",
+        ),
+      )
     }
     return next(error)
   }
